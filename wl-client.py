@@ -5,10 +5,10 @@
 # Architecture:
 #   TUN wltun0  →  PriorityQueue  →  8x PersistentSMTP  →  MP80:2525
 #   UDP:10080   →  RTP recv  →  decrypt  →  decompress  →  TUN wltun0
-#   At startup  →  send registration via SMTP
+#   At startup  →  send authenticated registration via SMTP
+#   Periodic    →  re-registration + RTP path probe
 #
-# Config via environment variables (see config_loader.py):
-#   PSK_HEX, RTP_PORT, SMTP_PORT, TUN_DEV, TUN_IP, TUN_GW, etc.
+# Config via environment variables (see config_loader.py)
 
 import os
 import sys
@@ -21,14 +21,16 @@ import threading
 import base64
 import json
 import hashlib
+import hmac
 import subprocess
 import collections
 import zstandard as zstd
+import signal
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 
-from config_loader import get_client_config
+from config_loader import get_client_config, save_roc_state
 
 # ── Load config ────────────────────────────────────────────────────────────────
 CFG = get_client_config()
@@ -39,16 +41,14 @@ IFF_NO_PI     = 0x1000
 
 # ── Logging config (from env) ────────────────────────────────────────────────
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
-LOG_RATE_LIMIT = int(os.environ.get('LOG_RATE_LIMIT', '0'))  # 0 = no limit
+LOG_RATE_LIMIT = int(os.environ.get('LOG_RATE_LIMIT', '0'))
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format='%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s'
 )
 
-# Optional: simple rate limiter for INFO/DEBUG to prevent log spam
 if LOG_RATE_LIMIT > 0:
-    import functools
     _last_log = {}
     _log_lock = threading.Lock()
 
@@ -63,9 +63,6 @@ if LOG_RATE_LIMIT > 0:
             elif level >= logging.WARNING:
                 logger.log(level, msg, *args, **kwargs)
 
-    # Patch logging methods
-    _orig_info = logging.info
-    _orig_debug = logging.debug
     def _ratelimited_info(msg, *args, **kwargs):
         rate_limited_log(logging.getLogger(), logging.INFO, msg, *args, **kwargs)
     def _ratelimited_debug(msg, *args, **kwargs):
@@ -74,21 +71,35 @@ if LOG_RATE_LIMIT > 0:
     logging.debug = _ratelimited_debug
 
 # ── Constants from config ──────────────────────────────────────────────────────
-TUN_DEV       = CFG['tun_dev']
-TUN_IP        = CFG['tun_ip']
-TUN_GW        = CFG['tun_gw']
-SMTP_PORT     = CFG['smtp_port']
-RTP_PORT      = CFG['rtp_port']
-REG_MAGIC     = CFG['reg_magic']
-FRAG_MAGIC    = CFG['frag_magic']
-ACK_THRESHOLD = CFG['ack_threshold']
-MAX_BATCH_PKTS = CFG['max_batch_pkts']
-MAX_BATCH_BYTES = CFG['max_batch_bytes']
-TX_STREAMS    = CFG['tx_streams']
-BATCH_MS_MAX  = CFG['batch_ms_max']
-BATCH_MS_MIN  = CFG['batch_ms_min']
-RTP_TIMEOUT   = CFG['rtp_timeout']
-RTP_KEY       = CFG['rtp_key']
+TUN_DEV            = CFG['tun_dev']
+TUN_IP             = CFG['tun_ip']
+TUN_GW             = CFG['tun_gw']
+SMTP_PORT          = CFG['smtp_port']
+RTP_PORT           = CFG['rtp_port']
+REG_MAGIC          = CFG['reg_magic']
+FRAG_MAGIC         = CFG['frag_magic']
+ACK_THRESHOLD      = CFG['ack_threshold']
+MAX_BATCH_PKTS     = CFG['max_batch_pkts']
+MAX_BATCH_BYTES    = CFG['max_batch_bytes']
+TX_STREAMS         = CFG['tx_streams']
+BATCH_MS_MAX       = CFG['batch_ms_max']
+BATCH_MS_MIN       = CFG['batch_ms_min']
+RTP_TIMEOUT        = CFG['rtp_timeout']
+
+# Crypto keys (separate per direction)
+RTP_KEY_RX         = CFG['rtp_key_rx']   # for decrypting server→client
+RTP_KEY_TX         = CFG['rtp_key_tx']   # for encrypting client→server (future use)
+REG_AUTH_KEY       = CFG['reg_auth_key'] # for signing registration
+
+# ROC persistence
+ROC_STATE          = CFG['roc_state']
+ROC                = ROC_STATE.get('roc', 0)
+SEQ                = ROC_STATE.get('seq', 0)
+
+# RTP recovery
+RTP_RECOVERY_ENABLED = CFG['rtp_recovery_enabled']
+RTP_RECOVERY_INTERVAL = CFG['rtp_recovery_interval']
+RTP_PROBE_INTERVAL  = CFG['rtp_probe_interval']
 
 # ── Priority Queue ─────────────────────────────────────────────────────────────
 class PriorityQueue:
@@ -106,9 +117,8 @@ class PriorityQueue:
             self.cond.notify()
 
     def put_raw(self, data):
-        """Put pre-framed raw data as single item (used for registration)."""
         with self.cond:
-            self.acks.appendleft(data)   # highest priority
+            self.acks.appendleft(data)
             self.cond.notify()
 
     def get_batch(self):
@@ -135,11 +145,11 @@ class PriorityQueue:
 
 
 tx_queue = PriorityQueue()
-rtp_alive = threading.Event()   # set when first RTP packet received
+rtp_alive = threading.Event()
+rtp_last_rx = 0  # timestamp of last RTP packet received
 
 # ── TUN ────────────────────────────────────────────────────────────────────────
 def get_own_ipv6():
-    """Parse own global IPv6 from ip addr."""
     try:
         out = subprocess.check_output(['ip', '-6', 'addr', 'show', 'scope', 'global'],
                                       text=True, stderr=subprocess.DEVNULL)
@@ -147,9 +157,8 @@ def get_own_ipv6():
             line = line.strip()
             if line.startswith('inet6') and 'temporary' not in line and TUN_DEV not in line:
                 addr = line.split()[1].split('/')[0]
-                if addr and not addr.startswith('fd'):   # prefer public, not Tailscale
+                if addr and not addr.startswith('fd'):
                     return addr
-        # fallback: any global
         for line in out.splitlines():
             line = line.strip()
             if line.startswith('inet6'):
@@ -174,21 +183,17 @@ def create_tun():
     subprocess.run(['sysctl', '-w', 'net.core.rmem_max=16777216'], check=False, capture_output=True)
     subprocess.run(['sysctl', '-w', 'net.core.wmem_max=16777216'], check=False, capture_output=True)
 
-    # Default route via tunnel (all traffic)
     subprocess.run(['ip', 'route', 'replace', 'default', 'via', TUN_GW, 'dev', TUN_DEV,
                     'metric', '50'], check=False, capture_output=True)
 
-    # MSS clamping — prevent TCP fragmentation issues
     for cmd in [
-        ['iptables',  '-t', 'mangle', '-C', 'FORWARD', '-p', 'tcp', '--tcp-flags', 'SYN,RST', 'SYN', '-j', 'TCPMSS', '--clamp-mss-to-pmtu'],
-        ['iptables',  '-t', 'mangle', '-C', 'OUTPUT',  '-p', 'tcp', '--tcp-flags', 'SYN,RST', 'SYN', '-j', 'TCPMSS', '--clamp-mss-to-pmtu'],
+        ['iptables', '-t', 'mangle', '-C', 'FORWARD', '-p', 'tcp', '--tcp-flags', 'SYN,RST', 'SYN', '-j', 'TCPMSS', '--clamp-mss-to-pmtu'],
+        ['iptables', '-t', 'mangle', '-C', 'OUTPUT',  '-p', 'tcp', '--tcp-flags', 'SYN,RST', 'SYN', '-j', 'TCPMSS', '--clamp-mss-to-pmtu'],
     ]:
         r = subprocess.run(cmd, capture_output=True)
         if r.returncode != 0:
             subprocess.run(cmd[:5] + ['-A'] + cmd[6:], check=False)
 
-    # CRITICAL: Do NOT route DNS through tunnel → avoids bootstrap deadlock
-    # Keep 8.8.8.8 and server IP on direct path
     server_ip = sys.argv[1] if len(sys.argv) > 1 else ''
     for host in ['8.8.8.8', '8.8.4.4', '1.1.1.1', server_ip]:
         try:
@@ -205,7 +210,6 @@ def create_tun():
     return fd
 
 
-# ── TUN reader → tx_queue ──────────────────────────────────────────────────────
 def tun_reader(tun_fd):
     threading.current_thread().name = 'TUN-READ'
     while True:
@@ -217,7 +221,7 @@ def tun_reader(tun_fd):
             time.sleep(0.001)
 
 
-# ── PersistentSMTP (same pattern as mp80-ip4) ──────────────────────────────────
+# ── PersistentSMTP ─────────────────────────────────────────────────────────────
 TXN_HDR = (
     b"MAIL FROM:<tun@wl.local>\r\n"
     b"RCPT TO:<tun@mp80.local>\r\n"
@@ -259,7 +263,7 @@ class PersistentSMTP:
         self.sock = s
         self.buf.clear()
         self._last_tx = time.monotonic()
-        self._read_line()   # 220 greeting
+        self._read_line()
         self.sock.sendall(b'EHLO wl.local\r\n')
         while True:
             l = self._read_line()
@@ -280,7 +284,6 @@ class PersistentSMTP:
         self._last_tx = time.monotonic()
 
     def send_raw(self, raw_framed: bytes):
-        """Send pre-framed data (e.g. registration packet)."""
         body = base64.b64encode(self.cctx.compress(raw_framed))
         self.sock.sendall(TXN_HDR + body + TXN_END)
         self._drain(4)
@@ -329,19 +332,33 @@ def smtp_tx_thread(idx, server_host):
             time.sleep(2)
 
 
-# ── Registration ───────────────────────────────────────────────────────────────
-def send_registration(server_host):
-    """Send registration to server via a dedicated SMTP connection."""
+# ── Registration with HMAC authentication ──────────────────────────────────────
+def build_registration(server_host: str) -> bytes:
+    """Build authenticated registration payload."""
+    global ROC, SEQ
     own_ipv6 = get_own_ipv6()
     if not own_ipv6:
         logging.warning('REG: could not determine own IPv6, using IPv4')
         own_ipv6 = socket.gethostbyname(socket.gethostname())
 
-    reg = json.dumps({'ipv6': own_ipv6, 'rtp_port': RTP_PORT}).encode()
-    payload = REG_MAGIC + reg
-    framed  = struct.pack('!I', len(payload)) + payload
+    reg_data = json.dumps({
+        'ipv6': own_ipv6,
+        'rtp_port': RTP_PORT,
+        'roc': ROC,
+        'seq': SEQ,
+        'ts': int(time.time())
+    }).encode()
 
-    logging.info(f'REG: sending registration, own IPv6={own_ipv6}')
+    # HMAC-SHA256 over registration data
+    auth_tag = hmac.new(REG_AUTH_KEY, reg_data, hashlib.sha256).digest()
+    payload = REG_MAGIC + auth_tag + reg_data
+    return struct.pack('!I', len(payload)) + payload
+
+
+def send_registration(server_host: str) -> bool:
+    """Send authenticated registration to server."""
+    framed = build_registration(server_host)
+    logging.info(f'REG: sending authenticated registration')
     conn = PersistentSMTP(server_host, 'REG')
     for attempt in range(5):
         try:
@@ -357,25 +374,28 @@ def send_registration(server_host):
     return False
 
 
-# ── RTP RX ─────────────────────────────────────────────────────────────────────
+# ── RTP RX with ROC persistence ────────────────────────────────────────────────
 class ReplayWindow:
-    def __init__(self, size=2048):
+    def __init__(self, size=65536):  # increased to cover full seq space
         self.size   = size
         self.bitmap = 0
         self.max_seq = -1
 
     def check(self, seq):
+        global ROC
+        full_seq = (ROC << 32) | seq
         if self.max_seq < 0:
-            self.max_seq = seq
+            self.max_seq = full_seq
             self.bitmap  = 1
             return True
-        if seq > self.max_seq:
-            shift = min(seq - self.max_seq, self.size)
+        if full_seq > self.max_seq:
+            shift = min(full_seq - self.max_seq, self.size)
             self.bitmap = (self.bitmap << shift) & ((1 << self.size) - 1)
             self.bitmap |= 1
-            self.max_seq = seq
+            self.max_seq = full_seq
+            ROC = full_seq >> 32
             return True
-        delta = self.max_seq - seq
+        delta = self.max_seq - full_seq
         if delta >= self.size: return False
         bit = 1 << delta
         if self.bitmap & bit: return False
@@ -383,12 +403,19 @@ class ReplayWindow:
         return True
 
 
+def build_nonce(seq: int) -> bytes:
+    """Build 12-byte nonce: ROC (4B) + SEQ (4B) + zeros (4B)."""
+    full_seq = (ROC << 32) | (seq & 0xFFFFFFFF)
+    return struct.pack('!Q', full_seq) + b'\x00\x00\x00\x00'
+
+
 def rtp_rx_thread(tun_fd):
+    global ROC, SEQ, rtp_last_rx
     threading.current_thread().name = 'RTP-RX'
-    cipher  = ChaCha20Poly1305(RTP_KEY)
+    cipher  = ChaCha20Poly1305(RTP_KEY_RX)
     dctx    = zstd.ZstdDecompressor()
     replay  = ReplayWindow()
-    frags   = {}   # seq → {total, parts}
+    frags   = {}
 
     sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
@@ -396,15 +423,10 @@ def rtp_rx_thread(tun_fd):
     sock.settimeout(5.0)
     sock.bind(('::', RTP_PORT))
 
-    roc = 0
     stat_bytes = 0
     stat_time  = time.monotonic()
 
     logging.info(f'RTP-RX: listening on UDP [::]:{RTP_PORT}')
-
-    def build_nonce(s):
-        idx = (roc << 32) | (s & 0xFFFFFFFF)
-        return struct.pack('!Q', idx) + b'\x00\x00\x00\x00'
 
     def process_payload(compressed):
         try:
@@ -435,11 +457,10 @@ def rtp_rx_thread(tun_fd):
 
         if len(data) < 12: continue
 
-        # Parse RTP header
         b0, b1, seq, ts, ssrc = struct.unpack_from('!BBHII', data)
-        if (b0 >> 6) != 2: continue    # wrong version
+        if (b0 >> 6) != 2: continue
         pt = b1 & 0x7F
-        if pt != 96: continue          # wrong payload type
+        if pt != 96: continue
 
         rtp_header = data[:12]
         encrypted  = data[12:]
@@ -450,22 +471,20 @@ def rtp_rx_thread(tun_fd):
         try:
             payload = cipher.decrypt(nonce, encrypted, rtp_header)
         except Exception:
-            continue   # auth failed
+            continue
 
         rtp_alive.set()
+        rtp_last_rx = time.monotonic()
         stat_bytes += len(data)
 
-        # Parse frag header (8 bytes): magic(2) rtp_seq(2) frag_idx(1) total(1) reserved(2)
         if len(payload) < 8: continue
         magic, rtp_seq, frag_idx, frag_total, _ = struct.unpack_from('!HHBBH', payload)
         if magic != FRAG_MAGIC: continue
         chunk = payload[8:]
 
         if frag_total == 1:
-            # Single fragment — process directly
             process_payload(chunk)
         else:
-            # Reassemble
             key = rtp_seq
             if key not in frags:
                 frags[key] = {'total': frag_total, 'parts': {}, 'ts': time.monotonic()}
@@ -475,7 +494,6 @@ def rtp_rx_thread(tun_fd):
                                      for i in range(frags[key]['total']))
                 del frags[key]
                 process_payload(assembled)
-            # Cleanup stale frag sets (> 5 seconds)
             now = time.monotonic()
             stale = [k for k, v in frags.items() if now - v['ts'] > 5.0]
             for k in stale: del frags[k]
@@ -487,38 +505,102 @@ def rtp_rx_thread(tun_fd):
             stat_bytes = 0; stat_time = now
 
 
+# ── RTP Recovery: periodic re-registration + probe ─────────────────────────────
+def rtp_recovery_thread(server_host: str, tun_fd: int):
+    """Periodically check RTP health and re-register if needed."""
+    global ROC, SEQ, rtp_last_rx
+    threading.current_thread().name = 'RTP-RECOVERY'
+
+    if not RTP_RECOVERY_ENABLED:
+        logging.info('RTP recovery disabled')
+        return
+
+    last_reg = 0
+    last_probe = 0
+
+    while True:
+        now = time.monotonic()
+        try:
+            # Check if RTP path is alive
+            rtp_ok = (now - rtp_last_rx) < RTP_RECOVERY_INTERVAL
+
+            if not rtp_ok and (now - last_reg) >= RTP_RECOVERY_INTERVAL:
+                logging.warning('RTP path appears down, re-registering...')
+                if send_registration(server_host):
+                    last_reg = now
+                    rtp_alive.clear()
+                    # Wait for RTP to come back
+                    if rtp_alive.wait(timeout=RTP_TIMEOUT):
+                        logging.info('RTP channel restored')
+                    else:
+                        logging.warning('RTP still down after re-registration')
+
+            # Periodic probe registration (even if RTP seems ok)
+            if (now - last_probe) >= RTP_PROBE_INTERVAL:
+                # Just send a lightweight registration to keep server state fresh
+                send_registration(server_host)
+                last_probe = now
+
+        except Exception as e:
+            logging.error(f'RTP recovery error: {e}')
+
+        time.sleep(5)
+
+
+# ── Graceful shutdown ──────────────────────────────────────────────────────────
+_shutdown = threading.Event()
+
+def signal_handler(signum, frame):
+    logging.info(f'Received signal {signum}, shutting down...')
+    _shutdown.set()
+
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
+    global ROC, SEQ
     if len(sys.argv) < 2:
         print('Usage: wl-client.py <server_ip>')
         sys.exit(1)
 
     server_ip = sys.argv[1]
-    logging.info(f'wl-client starting, server={server_ip}')
+    logging.info(f'wl-client starting, server={server_ip}, ROC={ROC}, SEQ={SEQ}')
 
     tun_fd = create_tun()
 
-    threading.Thread(target=tun_reader,  args=(tun_fd,),  daemon=True, name='TUN-READ').start()
+    # Start threads
+    threading.Thread(target=tun_reader, args=(tun_fd,), daemon=True, name='TUN-READ').start()
     threading.Thread(target=rtp_rx_thread, args=(tun_fd,), daemon=True, name='RTP-RX').start()
+    threading.Thread(target=rtp_recovery_thread, args=(server_ip, tun_fd), daemon=True, name='RTP-RECOVERY').start()
 
     for i in range(TX_STREAMS):
         threading.Thread(target=smtp_tx_thread, args=(i, server_ip),
                          daemon=True, name=f'SMTP-{i}').start()
 
-    # Wait for SMTP streams to connect, then register
+    # Initial registration
     time.sleep(3)
     send_registration(server_ip)
 
-    # Check if RTP arrives within timeout
     if rtp_alive.wait(timeout=RTP_TIMEOUT):
         logging.info('RTP channel alive — asymmetric mode active')
     else:
         logging.warning('No RTP received — running in SMTP-only mode (degraded)')
 
-    # Keep main thread alive
-    while True:
-        time.sleep(30)
-        logging.info(f'wl-client alive, rtp={rtp_alive.is_set()}')
+    # Main loop with periodic ROC save
+    last_roc_save = time.monotonic()
+    while not _shutdown.is_set():
+        _shutdown.wait(timeout=30)
+        now = time.monotonic()
+        if now - last_roc_save >= 60:
+            save_roc_state('client', ROC, SEQ)
+            last_roc_save = now
+            logging.info(f'wl-client alive, rtp={rtp_alive.is_set()}, ROC={ROC}, SEQ={SEQ}')
+
+    # Final save on shutdown
+    save_roc_state('client', ROC, SEQ)
+    logging.info('wl-client stopped')
 
 
 if __name__ == '__main__':

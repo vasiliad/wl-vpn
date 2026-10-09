@@ -1,8 +1,8 @@
 'use strict';
 // tunnel_wl_receiver.js — Haraka plugin for wl-vpn
 // Receives SMTP messages from wl-client containing:
-//   base64(zstd(framed_ip_packets))  — regular tunnel data
-//   base64(zstd(\x00WL-REG\x00 + json))  — registration packet
+//   base64(zstd(framed_ip_packets))           — regular tunnel data
+//   base64(zstd(REG_MAGIC + auth_tag + json)) — authenticated registration
 // Forwards raw decompressed bytes to wl-server.py via Unix socket /tmp/wl_tun.sock
 
 const net  = require('net');
@@ -33,14 +33,13 @@ function getSocket(logfn) {
         sockClient = null;
         reconnecting = false;
     });
-    return null;  // not ready yet, will be ready on next message
+    return null;
 }
 
 exports.register = function () {
     this.register_hook('rcpt',      'accept_all_rcpt');
     this.register_hook('data_post', 'process_payload');
 
-    // Pre-warm socket connection
     getSocket(this.loginfo.bind(this));
     this.loginfo('[wl] tunnel_wl_receiver loaded, sock=' + SOCK_PATH);
 };
@@ -76,14 +75,12 @@ exports.process_payload = function (next, connection) {
             connection.logdebug('[wl] payload: ' + decompressed.length + ' bytes decompressed');
 
             // Write raw decompressed data to unix socket (already framed by wl-client)
-            const frame = decompressed;  // data is already [4-byte len][payload]...
+            const frame = decompressed;
 
-            // Try persistent socket first, fallback to one-shot with retry
             const sock = getSocket(connection.loginfo.bind(connection));
             if (sock && !sock.destroyed) {
                 sock.write(frame);
             } else {
-                // Retry one-shot connection up to 3 times with 200ms backoff
                 let attempts = 0;
                 const tryConnect = () => {
                     attempts++;

@@ -5,7 +5,7 @@
 # Architecture:
 #   Haraka :2525  ← SMTP from wl-client (Russia)
 #   Haraka plugin → /tmp/wl_tun.sock → THIS PROCESS → TUN wltun0
-#   TUN wltun0    → RTP/SRTP/UDP → client IPv6:10080  (return traffic)
+#   TUN wltun0    → RTP/UDP → client IPv6:10080  (return traffic)
 #   TUN wltun0    → NAT → Internet
 #
 # Config via environment variables (see config_loader.py)
@@ -22,14 +22,16 @@ import asyncio
 import base64
 import json
 import hashlib
+import hmac
 import random
 import subprocess
 import zstandard as zstd
+import signal
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 
-from config_loader import get_server_config
+from config_loader import get_server_config, save_roc_state
 
 # ── Load config ────────────────────────────────────────────────────────────────
 CFG = get_server_config()
@@ -38,40 +40,10 @@ TUNSETIFF    = 0x400454ca
 IFF_TUN      = 0x0001
 IFF_NO_PI    = 0x1000
 
-# ── Logging config (from env) ────────────────────────────────────────────────
-LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
-LOG_RATE_LIMIT = int(os.environ.get('LOG_RATE_LIMIT', '0'))  # 0 = no limit
-
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=logging.INFO,
     format='%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s'
 )
-
-# Optional: simple rate limiter for INFO/DEBUG to prevent log spam
-if LOG_RATE_LIMIT > 0:
-    import functools
-    _last_log = {}
-    _log_lock = threading.Lock()
-
-    def rate_limited_log(logger, level, msg, *args, **kwargs):
-        now = time.monotonic()
-        key = (level, msg[:50])
-        with _log_lock:
-            last = _last_log.get(key, 0)
-            if now - last >= LOG_RATE_LIMIT:
-                _last_log[key] = now
-                logger.log(level, msg, *args, **kwargs)
-            elif level >= logging.WARNING:
-                logger.log(level, msg, *args, **kwargs)
-
-    _orig_info = logging.info
-    _orig_debug = logging.debug
-    def _ratelimited_info(msg, *args, **kwargs):
-        rate_limited_log(logging.getLogger(), logging.INFO, msg, *args, **kwargs)
-    def _ratelimited_debug(msg, *args, **kwargs):
-        rate_limited_log(logging.getLogger(), logging.DEBUG, msg, *args, **kwargs)
-    logging.info = _ratelimited_info
-    logging.debug = _ratelimited_debug
 
 # ── Constants from config ──────────────────────────────────────────────────────
 TUN_DEV      = CFG['tun_dev']
@@ -87,14 +59,24 @@ MAX_BATCH_BYTES = CFG['max_batch_bytes']
 BATCH_MS_MAX = CFG['batch_ms_max']
 BATCH_MS_MIN = CFG['batch_ms_min']
 RTP_MTU      = CFG['rtp_mtu']
-RTP_KEY      = CFG['rtp_key']
 
-# ── Shared state ───────────────────────────────────────────────────────────────
-client_ipv6 = None
+# Crypto keys (separate per direction)
+RTP_KEY_RX   = CFG['rtp_key_rx']   # for decrypting client→server
+RTP_KEY_TX   = CFG['rtp_key_tx']   # for encrypting server→client
+REG_AUTH_KEY = CFG['reg_auth_key'] # for verifying registration
+
+# ROC persistence
+ROC_STATE    = CFG['roc_state']
+ROC          = ROC_STATE.get('roc', 0)
+SEQ          = ROC_STATE.get('seq', 0)
+
+# Client tracking
+client_ipv6  = None
 client_port  = RTP_PORT
 rtp_ready    = threading.Event()
+client_last_reg = 0  # timestamp of last valid registration
 
-# ── Priority Queue ─────────────────────────────────────────────────────────────
+# ── Shared state ───────────────────────────────────────────────────────────────
 import collections
 
 class PriorityQueue:
@@ -167,7 +149,6 @@ def create_tun():
     return fd
 
 
-# ── TUN reader → tx_queue ──────────────────────────────────────────────────────
 def tun_reader(tun_fd):
     threading.current_thread().name = 'TUN-READ'
     while True:
@@ -179,24 +160,26 @@ def tun_reader(tun_fd):
             time.sleep(0.001)
 
 
-# ── RTP sender ─────────────────────────────────────────────────────────────────
+# ── RTP sender with ROC persistence ────────────────────────────────────────────
+def build_nonce(seq: int) -> bytes:
+    full_seq = (ROC << 32) | (seq & 0xFFFFFFFF)
+    return struct.pack('!Q', full_seq) + b'\x00\x00\x00\x00'
+
+
 def rtp_tx_thread():
+    global ROC, SEQ
     threading.current_thread().name = 'RTP-TX'
-    cipher = ChaCha20Poly1305(RTP_KEY)
+    cipher = ChaCha20Poly1305(RTP_KEY_TX)
     cctx   = zstd.ZstdCompressor(level=1)
     ssrc   = random.getrandbits(32)
-    seq    = random.randint(0, 65535)
+    seq    = SEQ
     ts     = random.randint(0, 2**32 - 1)
-    roc    = 0
+    roc    = ROC
     sock   = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
 
     stat_bytes = 0
     stat_time  = time.monotonic()
-
-    def build_nonce(s):
-        idx = (roc << 32) | (s & 0xFFFFFFFF)
-        return struct.pack('!Q', idx) + b'\x00\x00\x00\x00'
 
     def send_fragments(compressed):
         nonlocal seq, ts, roc
@@ -205,12 +188,10 @@ def rtp_tx_thread():
         total  = len(chunks)
         for frag_idx, chunk in enumerate(chunks):
             is_last = (frag_idx == total - 1)
-            # Build frag header (8 bytes): magic(2) seq(2) frag_idx(1) total(1) reserved(2)
             frag_hdr = struct.pack('!HHBBH', FRAG_MAGIC, seq & 0xFFFF, frag_idx, total, 0)
             payload  = frag_hdr + chunk
-            # RTP header (12 bytes)
             byte0  = 0x80
-            byte1  = (0x80 if is_last else 0) | 96   # marker on last, PT=96
+            byte1  = (0x80 if is_last else 0) | 96
             rtp_hdr = struct.pack('!BBHII', byte0, byte1, seq & 0xFFFF, ts & 0xFFFFFFFF, ssrc)
             nonce   = build_nonce(seq)
             enc     = cipher.encrypt(nonce, payload, rtp_hdr)
@@ -243,9 +224,24 @@ def rtp_tx_thread():
             time.sleep(0.1)
 
 
+# ── Client timeout watcher ─────────────────────────────────────────────────────
+def client_timeout_watcher():
+    global client_ipv6, client_port, rtp_ready
+    threading.current_thread().name = 'CLIENT-WATCH'
+    timeout = CFG.get('rtp_client_timeout', 60)
+
+    while True:
+        time.sleep(10)
+        if client_ipv6 and (time.monotonic() - client_last_reg) > timeout:
+            logging.warning(f'Client registration expired (>{timeout}s), resetting RTP')
+            client_ipv6 = None
+            client_port = RTP_PORT
+            rtp_ready.clear()
+
+
 # ── Unix socket server (receives from Haraka plugin) ───────────────────────────
 async def handle_unix_conn(reader, writer, tun_fd):
-    global client_ipv6, client_port
+    global client_ipv6, client_port, client_last_reg
     try:
         data = bytearray()
         while True:
@@ -253,7 +249,6 @@ async def handle_unix_conn(reader, writer, tun_fd):
             if not chunk: break
             data.extend(chunk)
 
-            # Process complete frames: [4-byte len][payload]
             offset = 0
             written = 0
             while offset + 4 <= len(data):
@@ -262,17 +257,36 @@ async def handle_unix_conn(reader, writer, tun_fd):
                     logging.error(f'Unix socket: invalid plen {plen}, resetting conn')
                     return
                 if offset + 4 + plen > len(data):
-                    break  # need more data
+                    break
 
                 payload = data[offset + 4 : offset + 4 + plen]
                 offset += 4 + plen
 
                 if payload[:len(REG_MAGIC)] == REG_MAGIC:
+                    # Parse: REG_MAGIC + auth_tag (32B) + reg_data (JSON)
+                    if len(payload) < len(REG_MAGIC) + 32:
+                        logging.error('REG: payload too short for auth tag')
+                        continue
+
+                    auth_tag = payload[len(REG_MAGIC):len(REG_MAGIC)+32]
+                    reg_data = payload[len(REG_MAGIC)+32:]
+
+                    # Verify HMAC
+                    expected_tag = hmac.new(REG_AUTH_KEY, reg_data, hashlib.sha256).digest()
+                    if not hmac.compare_digest(auth_tag, expected_tag):
+                        logging.error('REG: HMAC verification failed, dropping')
+                        continue
+
                     try:
-                        reg = json.loads(payload[len(REG_MAGIC):].decode())
+                        reg = json.loads(reg_data.decode())
                         client_ipv6 = reg['ipv6']
                         client_port = reg.get('rtp_port', RTP_PORT)
-                        logging.info(f'REG: client IPv6=[{client_ipv6}]:{client_port}')
+                        # Update ROC from client if provided
+                        global ROC, SEQ
+                        ROC = reg.get('roc', 0)
+                        SEQ = reg.get('seq', 0)
+                        client_last_reg = time.monotonic()
+                        logging.info(f'REG: authenticated client IPv6=[{client_ipv6}]:{client_port}, ROC={ROC}, SEQ={SEQ}')
                         rtp_ready.set()
                     except Exception as e:
                         logging.error(f'REG parse error: {e}')
@@ -286,7 +300,6 @@ async def handle_unix_conn(reader, writer, tun_fd):
             if written:
                 logging.debug(f'RX: wrote {written} pkts to TUN')
 
-            # Keep incomplete frame data in buffer
             del data[:offset]
 
     except Exception as e:
@@ -308,15 +321,47 @@ async def unix_server(tun_fd):
         await server.serve_forever()
 
 
+# ── Graceful shutdown ──────────────────────────────────────────────────────────
+_shutdown = threading.Event()
+
+def signal_handler(signum, frame):
+    logging.info(f'Received signal {signum}, shutting down...')
+    _shutdown.set()
+
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
-    logging.info('wl-server starting (Exit Node)')
+    global ROC, SEQ
+    logging.info(f'wl-server starting (Exit Node), ROC={ROC}, SEQ={SEQ}')
     tun_fd = create_tun()
 
     threading.Thread(target=tun_reader, args=(tun_fd,), daemon=True, name='TUN-READ').start()
     threading.Thread(target=rtp_tx_thread, daemon=True, name='RTP-TX').start()
+    threading.Thread(target=client_timeout_watcher, daemon=True, name='CLIENT-WATCH').start()
 
-    asyncio.run(unix_server(tun_fd))
+    # Periodic ROC save
+    def roc_saver():
+        last_save = time.monotonic()
+        while not _shutdown.is_set():
+            _shutdown.wait(timeout=30)
+            now = time.monotonic()
+            if now - last_save >= 60:
+                save_roc_state('server', ROC, SEQ)
+                last_save = now
+                logging.info(f'wl-server alive, ROC={ROC}, SEQ={SEQ}, client={client_ipv6}')
+
+    threading.Thread(target=roc_saver, daemon=True, name='ROC-SAVER').start()
+
+    try:
+        asyncio.run(unix_server(tun_fd))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        save_roc_state('server', ROC, SEQ)
+        logging.info('wl-server stopped')
 
 
 if __name__ == '__main__':

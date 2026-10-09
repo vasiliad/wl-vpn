@@ -5,6 +5,8 @@
 
 import os
 import hashlib
+import json
+from pathlib import Path
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 
@@ -18,6 +20,14 @@ def get_env_int(key: str, default: int) -> int:
     """Get env var as int with default."""
     val = os.environ.get(key)
     return int(val) if val is not None else default
+
+
+def get_env_bool(key: str, default: bool = False) -> bool:
+    """Get env var as bool with default."""
+    val = os.environ.get(key)
+    if val is None:
+        return default
+    return val.lower() in ('1', 'true', 'yes', 'on')
 
 
 def load_psk() -> bytes:
@@ -39,6 +49,31 @@ def derive_key(label: bytes) -> bytes:
     return hkdf.derive(PSK)
 
 
+# ROC persistence
+ROC_STATE_DIR = Path(get_env('ROC_STATE_DIR', '/var/lib/wl-vpn'))
+ROC_STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_roc_state(role: str) -> dict:
+    """Load ROC/seq state from disk for restart resilience."""
+    path = ROC_STATE_DIR / f'roc_{role}.json'
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            pass
+    return {'roc': 0, 'seq': 0}
+
+
+def save_roc_state(role: str, roc: int, seq: int):
+    """Save ROC/seq state to disk."""
+    path = ROC_STATE_DIR / f'roc_{role}.json'
+    try:
+        path.write_text(json.dumps({'roc': roc, 'seq': seq}))
+    except Exception:
+        pass  # best effort
+
+
 # ── Client config ─────────────────────────────────────────────────────────────
 CLIENT_CFG = {
     'tun_dev': get_env('TUN_DEV', 'wltun0'),
@@ -55,7 +90,19 @@ CLIENT_CFG = {
     'batch_ms_max': get_env_int('BATCH_MS_MAX', 80) / 1000.0,
     'batch_ms_min': get_env_int('BATCH_MS_MIN', 2) / 1000.0,
     'rtp_timeout': get_env_int('RTP_TIMEOUT', 10),
-    'rtp_key': derive_key(get_env('RTP_KEY_LABEL', 'wl-vpn-rtp-server-to-client').encode()),
+
+    # Crypto keys (separate per direction)
+    'rtp_key_rx': derive_key(get_env('RTP_KEY_LABEL_RX', 'wl-vpn-rtp-server-to-client').encode()),
+    'rtp_key_tx': derive_key(get_env('RTP_KEY_LABEL_TX', 'wl-vpn-rtp-client-to-server').encode()),
+    'reg_auth_key': derive_key(b'wl-vpn-registration-auth'),
+
+    # ROC persistence
+    'roc_state': load_roc_state('client'),
+
+    # RTP recovery
+    'rtp_recovery_enabled': get_env_bool('RTP_RECOVERY_ENABLED', True),
+    'rtp_recovery_interval': get_env_int('RTP_RECOVERY_INTERVAL', 30),
+    'rtp_probe_interval': get_env_int('RTP_PROBE_INTERVAL', 10),
 }
 
 # ── Server config ─────────────────────────────────────────────────────────────
@@ -73,7 +120,18 @@ SERVER_CFG = {
     'batch_ms_max': get_env_int('BATCH_MS_MAX', 50) / 1000.0,
     'batch_ms_min': get_env_int('BATCH_MS_MIN', 2) / 1000.0,
     'rtp_mtu': get_env_int('RTP_MTU', 1200),
-    'rtp_key': derive_key(get_env('RTP_KEY_LABEL', 'wl-vpn-rtp-server-to-client').encode()),
+
+    # Crypto keys (separate per direction)
+    'rtp_key_rx': derive_key(get_env('RTP_KEY_LABEL_RX', 'wl-vpn-rtp-client-to-server').encode()),
+    'rtp_key_tx': derive_key(get_env('RTP_KEY_LABEL_TX', 'wl-vpn-rtp-server-to-client').encode()),
+    'reg_auth_key': derive_key(b'wl-vpn-registration-auth'),
+
+    # ROC persistence
+    'roc_state': load_roc_state('server'),
+
+    # RTP recovery
+    'rtp_recovery_enabled': get_env_bool('RTP_RECOVERY_ENABLED', True),
+    'rtp_client_timeout': get_env_int('RTP_CLIENT_TIMEOUT', 60),
 }
 
 

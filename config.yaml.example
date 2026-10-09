@@ -73,12 +73,17 @@ crypto:
   psk_hex: "your_64_char_hex_string_here"
 
   # Key labels (don't change unless you know what you're doing)
-  rtp_key_label_client_to_server: "wl-vpn-rtp-client-to-server"
-  rtp_key_label_server_to_client: "wl-vpn-rtp-server-to-client"
+  # RX = key used for decrypting incoming RTP
+  # TX = key used for encrypting outgoing RTP
+  rtp_key_label_rx: "wl-vpn-rtp-server-to-client"  # client RX / server TX
+  rtp_key_label_tx: "wl-vpn-rtp-client-to-server"  # client TX / server RX
 
   # Registration magic bytes
   reg_magic: "00574c2d52454700"    # \x00WL-REG\x00 in hex
   frag_magic: "574c"               # "WL" in hex
+
+  # Registration auth (HMAC-SHA256 derived from PSK)
+  reg_auth_label: "wl-vpn-registration-auth"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Deployment (for deploy.py)
@@ -106,6 +111,21 @@ deploy:
     mp80_outbound_tcp: [2525]      # SMTP (Haraka already listens)
     rus2_inbound_udp: [10080]      # RTP in to RUS2
     rus2_inbound_tcp: []           # Client only initiates outbound
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROC Persistence (restart resilience)
+# ─────────────────────────────────────────────────────────────────────────────
+roc:
+  state_dir: "/var/lib/wl-vpn"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RTP Recovery (auto-reconnect)
+# ─────────────────────────────────────────────────────────────────────────────
+rtp_recovery:
+  enabled: true
+  recovery_interval_sec: 30      # Client: seconds without RTP before re-register
+  probe_interval_sec: 10         # Client: periodic registration probe
+  client_timeout_sec: 60         # Server: seconds without reg before client dead
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging (anti-disk-fill)

@@ -62,6 +62,19 @@ RTP_PORT = int(get('RTP_PORT') or CFG.get('client', {}).get('rtp_port', 10080))
 SMTP_PORT = int(get('SMTP_PORT') or CFG.get('client', {}).get('smtp_port', 2525))
 PSK_HEX = get('PSK_HEX') or CFG.get('crypto', {}).get('psk_hex', '')
 
+# New crypto key labels (separate per direction)
+RTP_KEY_LABEL_RX = get('RTP_KEY_LABEL_RX', 'wl-vpn-rtp-server-to-client')
+RTP_KEY_LABEL_TX = get('RTP_KEY_LABEL_TX', 'wl-vpn-rtp-client-to-server')
+
+# ROC state directory
+ROC_STATE_DIR = get('ROC_STATE_DIR', '/var/lib/wl-vpn')
+
+# RTP recovery settings
+RTP_RECOVERY_ENABLED = get('RTP_RECOVERY_ENABLED', 'true').lower() in ('1', 'true', 'yes', 'on')
+RTP_RECOVERY_INTERVAL = int(get('RTP_RECOVERY_INTERVAL', '30'))
+RTP_PROBE_INTERVAL = int(get('RTP_PROBE_INTERVAL', '10'))
+RTP_CLIENT_TIMEOUT = int(get('RTP_CLIENT_TIMEOUT', '60'))
+
 HARAKA_PLUGINS_DIR = get('HARAKA_PLUGINS_DIR') or MP80_CFG.get('haraka_plugins_dir', '/usr/local/haraka/plugins')
 HARAKA_CONFIG_PLUGINS = MP80_CFG.get('haraka_config_plugins', '/usr/local/haraka/config/plugins')
 
@@ -156,9 +169,17 @@ LogRateLimitBurst=1000
 Environment=LOG_LEVEL=INFO
 # Python internal rate limit (seconds between same message), 0 = off
 Environment=LOG_RATE_LIMIT=5
+# Crypto
 Environment=PSK_HEX={PSK_HEX}
 Environment=RTP_PORT={RTP_PORT}
 Environment=SMTP_PORT={SMTP_PORT}
+Environment=RTP_KEY_LABEL_RX={RTP_KEY_LABEL_RX}
+Environment=RTP_KEY_LABEL_TX={RTP_KEY_LABEL_TX}
+# ROC persistence
+Environment=ROC_STATE_DIR={ROC_STATE_DIR}
+# RTP recovery
+Environment=RTP_RECOVERY_ENABLED={str(RTP_RECOVERY_ENABLED).lower()}
+Environment=RTP_CLIENT_TIMEOUT={RTP_CLIENT_TIMEOUT}
 
 [Install]
 WantedBy=multi-user.target
@@ -181,6 +202,12 @@ Environment=LOG_RATE_LIMIT=5
 Environment=PSK_HEX={PSK_HEX}
 Environment=RTP_PORT={RTP_PORT}
 Environment=SMTP_PORT={SMTP_PORT}
+Environment=RTP_KEY_LABEL_RX={RTP_KEY_LABEL_RX}
+Environment=RTP_KEY_LABEL_TX={RTP_KEY_LABEL_TX}
+Environment=ROC_STATE_DIR={ROC_STATE_DIR}
+Environment=RTP_RECOVERY_ENABLED={str(RTP_RECOVERY_ENABLED).lower()}
+Environment=RTP_RECOVERY_INTERVAL={RTP_RECOVERY_INTERVAL}
+Environment=RTP_PROBE_INTERVAL={RTP_PROBE_INTERVAL}
 
 [Install]
 WantedBy=multi-user.target
