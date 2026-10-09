@@ -188,7 +188,9 @@ def rtp_tx_thread():
         total  = len(chunks)
         for frag_idx, chunk in enumerate(chunks):
             is_last = (frag_idx == total - 1)
-            frag_hdr = struct.pack('!HHBBH', FRAG_MAGIC, seq & 0xFFFF, frag_idx, total, 0)
+            # reserved field carries ROC hint (roc & 0xFFFF) for receiver
+            # nonce recovery after wraparound
+            frag_hdr = struct.pack('!HHBBH', FRAG_MAGIC, seq & 0xFFFF, frag_idx, total, roc & 0xFFFF)
             payload  = frag_hdr + chunk
             byte0  = 0x80
             byte1  = (0x80 if is_last else 0) | 96

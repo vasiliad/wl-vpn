@@ -467,11 +467,22 @@ def rtp_rx_thread(tun_fd):
 
         if not replay.check(seq): continue
 
-        nonce = build_nonce(seq)
-        try:
-            payload = cipher.decrypt(nonce, encrypted, rtp_header)
-        except Exception:
-            continue
+        # Decrypt with current ROC; on fail, retry ROC+1 (sender wrapped
+        # and our ROC is stale). On success, persist new ROC.
+        payload = None
+        for try_roc in (ROC, ROC + 1):
+            full_seq = (try_roc << 32) | (seq & 0xFFFFFFFF)
+            nonce = struct.pack('!Q', full_seq) + b'\x00\x00\x00\x00'
+            try:
+                payload = cipher.decrypt(nonce, encrypted, rtp_header)
+                if try_roc != ROC:
+                    ROC = try_roc
+                    logging.warning(f'RTP-RX: ROC resync → {ROC} (wraparound)')
+                break
+            except Exception:
+                continue
+        if payload is None:
+            continue   # auth failed both ways
 
         rtp_alive.set()
         rtp_last_rx = time.monotonic()

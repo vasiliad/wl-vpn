@@ -297,6 +297,93 @@ check('rtp_mtu default 1200', sc['rtp_mtu'] == 1200)
 
 print()
 print('=' * 70)
+print('TEST 8: ROC hint in frag header (wraparound recovery)')
+print('=' * 70)
+
+# Sender-side: ROC wrapped (roc=1), receiver still has stale ROC=0.
+# Sender puts ROC hint into frag header reserved field.
+client.ROC = 0  # stale receiver ROC
+srv_cipher2 = ChaCha20Poly1305(sc['rtp_key_tx'])
+cli_cipher2 = ChaCha20Poly1305(cc['rtp_key_rx'])
+
+tx_roc, tx_seq = 1, 42
+payload2 = os.urandom(500)
+frag_hdr2 = struct.pack('!HHBBH', FRAG_MAGIC, tx_seq & 0xFFFF, 0, 1, tx_roc & 0xFFFF)
+rtp_hdr2 = struct.pack('!BBHII', 0x80, 0x80 | 96, tx_seq & 0xFFFF, 90000, ssrc)
+# Sender encrypts with its FULL 48-bit index
+sender_nonce = struct.pack('!Q', (tx_roc << 32) | tx_seq) + b'\x00\x00\x00\x00'
+enc2 = srv_cipher2.encrypt(sender_nonce, frag_hdr2 + payload2, rtp_hdr2)
+wire2 = rtp_hdr2 + enc2
+
+# Receiver decrypts with stale ROC → must FAIL
+stale_nonce = struct.pack('!Q', (0 << 32) | tx_seq) + b'\x00\x00\x00\x00'
+try:
+    cli_cipher2.decrypt(stale_nonce, wire2[12:], rtp_hdr2)
+    stale_fails = False
+except Exception:
+    stale_fails = True
+check('stale-ROC decrypt fails (as expected)', stale_fails,
+      'unexpected: stale ROC decrypts')
+
+# Receiver reads ROC hint from frag header... but WAIT: frag header is INSIDE
+# the encrypted payload. Hint-in-frag-header only works AFTER successful
+# decrypt — it helps with REASSEMBLY, not with nonce recovery.
+# The correct nonce-recovery design: receiver tries ROC+1 on decrypt-fail.
+client.ROC = 1
+resync_nonce = struct.pack('!Q', (1 << 32) | tx_seq) + b'\x00\x00\x00\x00'
+dec2 = cli_cipher2.decrypt(resync_nonce, wire2[12:], rtp_hdr2)
+check('ROC+1 retry decrypts OK', dec2 == frag_hdr2 + payload2)
+
+# ROC hint IS useful for reassembly: read it from decrypted payload
+magic2, rseq2, fidx2, ftot2, roc_hint = struct.unpack_from('!HHBBH', dec2)
+check('ROC hint read from frag header', roc_hint == (tx_roc & 0xFFFF),
+      f'got {roc_hint}, want {tx_roc & 0xFFFF}')
+
+# Reserved field defaults to 0 (backward compat with old sender)
+old_hdr = struct.pack('!HHBBH', FRAG_MAGIC, 7, 0, 1, 0)
+magic3, _, _, _, roc_hint3 = struct.unpack_from('!HHBBH', old_hdr)
+check('old sender (reserved=0) → hint 0', roc_hint3 == 0)
+
+# Full wire roundtrip with ROC hint: server roc=3 wrapping mid-batch
+client.ROC = 3
+srv_roc3, srv_seq3 = 3, 65534  # about to wrap
+batches = []
+# simulate: 3 RTP packets crossing the wrap
+for i in range(3):
+    sq = (srv_seq3 + i) & 0xFFFF
+    roc_i = srv_roc3 + (1 if srv_seq3 + i > 0xFFFF else 0)
+    fh = struct.pack('!HHBBH', FRAG_MAGIC, sq, 0, 1, roc_i & 0xFFFF)
+    rh = struct.pack('!BBHII', 0x80, 0x80 | 96, sq, 90000 + i, ssrc)
+    n = struct.pack('!Q', (roc_i << 32) | sq) + b'\x00\x00\x00\x00'
+    e = srv_cipher2.encrypt(n, fh + b'X' * 100, rh)
+    batches.append((rh + e, roc_i))
+
+# Client-side recovery loop: decrypt with current ROC, on fail try hint/ROC+1
+client.ROC = 3
+received = 0
+roc_updates = []
+for wire_pkt, true_roc in batches:
+    b0_, b1_, sq_, _, _ = struct.unpack_from('!BBHII', wire_pkt)
+    hdr = wire_pkt[:12]
+    got = None
+    for try_roc in (client.ROC, client.ROC + 1):
+        n = struct.pack('!Q', (try_roc << 32) | sq_) + b'\x00\x00\x00\x00'
+        try:
+            got = cli_cipher2.decrypt(n, wire_pkt[12:], hdr)
+            if try_roc != client.ROC:
+                client.ROC = try_roc
+                roc_updates.append(try_roc)
+            break
+        except Exception:
+            continue
+    if got is not None:
+        received += 1
+check('all 3 packets across wrap received', received == 3, f'got {received}/3')
+check('client ROC updated to 4 after wrap', client.ROC == 4, f'got {client.ROC}')
+check('ROC updated exactly once (not per-packet)', len(roc_updates) == 1, f'updates={roc_updates}')
+
+print()
+print('=' * 70)
 print(f'RESULTS: {PASS} passed, {FAIL} failed')
 print('=' * 70)
 if FAILURES:
