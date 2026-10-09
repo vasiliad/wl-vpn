@@ -1,0 +1,122 @@
+# wl-vpn configuration
+# Copy to config.yaml and adjust
+# NEVER commit config.yaml with real values to git!
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Client side (Russia / RUS2)
+# ─────────────────────────────────────────────────────────────────────────────
+client:
+  # Server to connect to (MP80 IPv6 for RTP, IPv4 for SMTP)
+  server_ipv4: "100.68.139.8"      # MP80 public IPv4 (SMTP)
+  server_ipv6: "2a00:a041:e442:7100:215:5dff:fe00:200"  # MP80 public IPv6 (RTP return)
+
+  # Local bind
+  rtp_port: 10080                  # UDP port for RTP receive
+  smtp_port: 2525                  # TCP port for SMTP send
+
+  # TUN interface
+  tun_device: "wltun0"
+  tun_ip: "10.0.200.1/30"
+  tun_gateway: "10.0.200.2"
+  tun_mtu: 1400
+
+  # SMTP streams
+  tx_streams: 8                    # Number of parallel SMTP connections
+
+  # Batching
+  batch_ms_max: 80                 # Max wait for batch (ms)
+  batch_ms_min: 2                  # Min wait after first packet (ms)
+  max_batch_pkts: 200
+  max_batch_bytes: 65536
+
+  # Priority queue thresholds
+  ack_threshold: 120               # Packets <= this bytes go to high-priority queue
+  ack_queue_max: 2000
+  norm_queue_max: 20000
+
+  # RTP timeout
+  rtp_timeout_sec: 10              # Wait for first RTP before degraded mode
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Server side (Israel / MP80)
+# ─────────────────────────────────────────────────────────────────────────────
+server:
+  # Listen addresses
+  rtp_port: 10080                  # UDP port for RTP send
+  smtp_port: 2525                  # TCP port for Haraka SMTP
+  unix_socket: "/tmp/wl_tun.sock"  # Haraka plugin → server
+
+  # TUN interface
+  tun_device: "wltun0"
+  tun_ip: "10.0.200.2/30"
+  tun_gateway: "10.0.200.1"
+  tun_mtu: 1400
+
+  # Batching (server → client)
+  batch_ms_max: 50
+  batch_ms_min: 2
+  max_batch_pkts: 200
+  max_batch_bytes: 65536
+  ack_threshold: 120
+  ack_queue_max: 2000
+  norm_queue_max: 20000
+
+  # RTP fragmentation
+  rtp_mtu: 1200                    # Max payload per RTP packet
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Crypto (MUST match on both sides)
+# ─────────────────────────────────────────────────────────────────────────────
+crypto:
+  # PSK: 32 bytes hex (64 chars). Generate: openssl rand -hex 32
+  # Derives separate keys for client→server and server→client via HKDF
+  psk_hex: "your_64_char_hex_string_here"
+
+  # Key labels (don't change unless you know what you're doing)
+  rtp_key_label_client_to_server: "wl-vpn-rtp-client-to-server"
+  rtp_key_label_server_to_client: "wl-vpn-rtp-server-to-client"
+
+  # Registration magic bytes
+  reg_magic: "00574c2d52454700"    # \x00WL-REG\x00 in hex
+  frag_magic: "574c"               # "WL" in hex
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deployment (for deploy.py)
+# ─────────────────────────────────────────────────────────────────────────────
+deploy:
+  mp80:
+    host: "100.68.139.8"
+    user: "root"
+    # password: set via env MP80_PASSWORD or use SSH key
+    haraka_plugins_dir: "/usr/local/haraka/plugins"
+    haraka_config_plugins: "/usr/local/haraka/config/plugins"
+    systemd_dir: "/etc/systemd/system"
+    python_deps: ["zstandard", "cryptography"]
+
+  rus2:
+    host: "46.29.164.96"
+    user: "root"
+    # password: set via env RUS2_PASSWORD or use SSH key
+    systemd_dir: "/etc/systemd/system"
+    python_deps: ["zstandard", "cryptography"]
+
+  # Firewall ports to open
+  firewall:
+    mp80_outbound_udp: [10080]     # RTP out from MP80
+    mp80_outbound_tcp: [2525]      # SMTP (Haraka already listens)
+    rus2_inbound_udp: [10080]      # RTP in to RUS2
+    rus2_inbound_tcp: []           # Client only initiates outbound
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging (anti-disk-fill)
+# ─────────────────────────────────────────────────────────────────────────────
+logging:
+  level: "INFO"                    # DEBUG, INFO, WARNING, ERROR
+  rate_limit_sec: 5                # Seconds between same message (0 = off)
+  # journald limits (deployed via systemd drop-in)
+  journald_system_max_use: "500M"
+  journald_system_max_file: "100M"
+  journald_max_retention: "7day"
+  # logrotate for /var/log/wl-*.log
+  logrotate_maxsize: "100M"
+  logrotate_rotate: 7
